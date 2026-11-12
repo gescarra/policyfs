@@ -243,3 +243,25 @@ func TestFUSE_Setattr_truncateChmodUtimens(t *testing.T) {
 		require.WithinDuration(t, mt, st.ModTime(), 2*time.Second)
 	})
 }
+
+// TestFUSE_Setattr_chmod_appliesToAllCopies verifies chmod changes every copy of a file.
+func TestFUSE_Setattr_chmod_appliesToAllCopies(t *testing.T) {
+	withMountedFS(t, IntegrationConfig{
+		ReadTargets: []string{"ssd2", "ssd1"},
+		Targets:     []string{"ssd2", "ssd1"},
+	}, func(env *MountedFS) {
+		// Setup: create the same file on both targets.
+		rel := "fuse-mutate/setattr-all/file.txt"
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd1", rel)
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd2", rel)
+
+		// Action: chmod through the mount.
+		require.NoError(t, os.Chmod(env.MountPath(rel), 0o600))
+
+		// Verify: both copies changed.
+		for _, id := range []string{"ssd1", "ssd2"} {
+			st := env.MustStatT(t, env.StoragePath(id, rel))
+			require.Equal(t, uint32(0o600), uint32(st.Mode)&0o777)
+		}
+	})
+}

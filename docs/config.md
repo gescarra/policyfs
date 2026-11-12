@@ -247,10 +247,21 @@ wins: if a path matches `ignore` or `ignore_file`, it is skipped regardless of `
 | `policy`             | string | `most_free` | Target selection: `most_free`, `least_free`, or `first_found`.                                                                                                                                                                |
 | `skip_if_exists_any` | bool   | `false`     | If `true`, skip a candidate when the destination path already exists on any destination storage (avoids duplicates; may increase disk I/O). When a file is skipped, `delete_source` does not apply - the source file is kept. |
 | `path_preserving`    | bool   | `false`     | Prefer destinations where the parent directory already exists. The mover applies `min_free_gb` to those destinations first, then falls back to all destinations if none remain eligible.                                      |
+| `mode`               | string | `single`    | `single` moves each file to one destination chosen by `policy`. `mirror` keeps a copy on every destination; see [Mirroring](#mirroring).                                                                                      |
 
 When a move needs a missing destination parent, it creates each missing component separately. New directories copy ownership and permissions from the corresponding source directories, retain group write and traversal, and preserve setgid semantics. Existing destination directories are not changed, and symlink components are rejected.
 
 The mover must have permission to create directories and apply source ownership. Packaged systemd units run as root by default.
+
+#### Mirroring
+
+With `mode: mirror`, the mover copies each candidate to every destination storage path instead of picking one:
+
+- A destination that already has a copy with the same size and mtime is left alone. Indexed destinations are checked through the index, so in-sync disks are not woken.
+- A missing or stale copy is (re)written atomically. Runs are idempotent: re-running a job only fills in what is missing.
+- A destination that is offline or below `min_free_gb` is skipped with a warning, and the file is reported as `partial`. The next run retries it.
+- `delete_source` only removes the source once every destination holds an up-to-date copy. If the source is itself a destination, it is never deleted.
+- `policy` is ignored. `skip_if_exists_any` and `path_preserving` are not supported.
 
 #### `conditions`
 

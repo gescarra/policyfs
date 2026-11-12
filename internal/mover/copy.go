@@ -94,6 +94,7 @@ func (e *skipError) Unwrap() error {
 type copyLocation struct {
 	root         string
 	physicalPath string
+	overwrite    bool
 }
 
 // copyFileWithVerify copies a file to destination with optional checksum verification and metadata-aware parents.
@@ -105,10 +106,12 @@ func copyFileWithVerify(ctx context.Context, srcLocation copyLocation, dstLocati
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("copy canceled: %w", err)
 	}
-	if _, err := os.Stat(dstLocation.physicalPath); err == nil {
-		return &skipError{Cause: errDestinationExists}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to stat destination: %w", err)
+	if !dstLocation.overwrite {
+		if _, err := os.Stat(dstLocation.physicalPath); err == nil {
+			return &skipError{Cause: errDestinationExists}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to stat destination: %w", err)
+		}
 	}
 
 	createdDirs, err := ensureDestinationParent(srcLocation, dstLocation)

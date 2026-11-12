@@ -21,6 +21,7 @@ const (
 	DefaultJobLockFile     = "job.lock"
 	DefaultWritePolicy     = "first_found"
 	DefaultMovePolicy      = "most_free"
+	DefaultMoveMode        = "single"
 	DefaultMoveStartPct    = 80
 	DefaultMoveStopPct     = 70
 	DefaultStatfsReporting = "mount_pooled_targets"
@@ -205,6 +206,7 @@ type MoverDestinationConfig struct {
 	Policy          string   `yaml:"policy"`
 	SkipIfExistsAny bool     `yaml:"skip_if_exists_any"`
 	PathPreserving  bool     `yaml:"path_preserving"`
+	Mode            string   `yaml:"mode"`
 }
 
 // MoverConditionsConfig filters candidates.
@@ -298,6 +300,9 @@ func (c *RootConfig) applyDefaults() {
 			}
 			if strings.TrimSpace(j.Destination.Policy) == "" {
 				j.Destination.Policy = DefaultMovePolicy
+			}
+			if strings.TrimSpace(j.Destination.Mode) == "" {
+				j.Destination.Mode = DefaultMoveMode
 			}
 			if j.DeleteSource == nil {
 				ds := true

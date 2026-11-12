@@ -12,6 +12,8 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hieutdo/policyfs/internal/errkind"
 	"github.com/hieutdo/policyfs/internal/eventlog"
+	"github.com/hieutdo/policyfs/internal/router"
+	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 )
 
@@ -108,85 +110,14 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 	}
 	// Indexed targets use deferred SETATTR (no physical ops).
 	if indexed {
-		if n.db == nil {
-			log.Error().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("failed to setattr: db is nil for indexed target")
-			return syscall.EIO
-		}
-		cur, ok, err := n.db.GetEffectiveFile(ctx, indexedStorageID, virtualPath)
-		if err != nil {
-			return toErrno(fmt.Errorf("failed to getattr indexed file: %w", err))
-		}
-		if !ok {
-			log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("setattr indexed entry missing after resolution")
-			return syscall.ENOENT
-		}
-
 		if _, ok := in.GetSize(); ok {
 			log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("setattr blocked: truncate on indexed target")
 			return syscall.EROFS
 		}
-
-		uid, uok := in.GetUID()
-		gid, gok := in.GetGID()
-		if uok || gok {
-			if callerOK && caller.Uid != 0 {
-				return syscall.EPERM
-			}
+		if errno := n.setattrIndexed(ctx, log, caller, callerOK, indexedStorageID, virtualPath, in); errno != 0 {
+			return errno
 		}
-
-		var modePtr *uint32
-		if m, ok := in.GetMode(); ok {
-			if callerOK && caller.Uid != 0 {
-				if cur.UID != caller.Uid {
-					return syscall.EPERM
-				}
-			}
-			newMode := (cur.Mode & ^uint32(0o7777)) | (m & uint32(0o7777))
-			modePtr = &newMode
-		}
-
-		var uidPtr *uint32
-		var gidPtr *uint32
-		if uok {
-			u := uint32(uid)
-			uidPtr = &u
-		}
-		if gok {
-			g := uint32(gid)
-			gidPtr = &g
-		}
-
-		var mtimePtr *int64
-		if mtime, mok := in.GetMTime(); mok {
-			if callerOK && caller.Uid != 0 {
-				if cur.UID != caller.Uid {
-					return syscall.EPERM
-				}
-			}
-			mt := mtime.Unix()
-			mtimePtr = &mt
-		}
-
-		haveAny := modePtr != nil || uidPtr != nil || gidPtr != nil || mtimePtr != nil
-		if haveAny {
-			updated, err := n.db.UpsertMeta(ctx, indexedStorageID, virtualPath, modePtr, uidPtr, gidPtr, mtimePtr)
-			if err != nil {
-				return toErrno(err)
-			}
-			if !updated {
-				log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("setattr indexed metadata update missed")
-			}
-			if updated {
-				log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("setattr updated indexed metadata")
-				if err := eventlog.Append(ctx, n.mountName, eventlog.SetattrEvent{Type: eventlog.TypeSetattr, StorageID: indexedStorageID, Path: virtualPath, Mode: modePtr, UID: uidPtr, GID: gidPtr, MTime: mtimePtr, TS: time.Now().Unix()}); err != nil {
-					log.Error().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Err(err).Msg("failed to append eventlog")
-					return syscall.EIO
-				}
-				log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Msg("setattr appended deferred event")
-			}
-		}
-
-		cur, ok, err = n.db.GetEffectiveFile(ctx, indexedStorageID, virtualPath)
+		cur, ok, err := n.db.GetEffectiveFile(ctx, indexedStorageID, virtualPath)
 		if err != nil {
 			return toErrno(fmt.Errorf("failed to getattr indexed file: %w", err))
 		}
@@ -202,20 +133,187 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 		out.Nlink = 1
 		out.Uid = cur.UID
 		out.Gid = cur.GID
-		ev := log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Bool("indexed", true)
-		if modePtr != nil {
-			ev = ev.Bool("chmod", true)
+	} else {
+		if errno := setattrPhysical(caller, callerOK, fh, physicalPath, in); errno != 0 {
+			return errno
 		}
-		if uidPtr != nil || gidPtr != nil {
-			ev = ev.Bool("chown", true)
+		if sz, ok := in.GetSize(); ok {
+			// truncate: prefer ftruncate when we have a file handle.
+			if fh != nil {
+				if err := syscall.Ftruncate(fh.fd, int64(sz)); err != nil {
+					return toErrno(err)
+				}
+			} else {
+				if err := syscall.Truncate(physicalPath, int64(sz)); err != nil {
+					return toErrno(err)
+				}
+			}
 		}
-		if mtimePtr != nil {
-			ev = ev.Bool("utimens", true)
+		st := syscall.Stat_t{}
+		if err := syscall.Lstat(physicalPath, &st); err != nil {
+			return toErrno(err)
 		}
-		ev.Msg("setattr")
+		out.FromStat(&st)
+	}
+
+	if errno := n.setattrCopies(ctx, log, rt, caller, callerOK, indexedStorageID, virtualPath, in); errno != 0 {
+		return errno
+	}
+
+	_, chmod := in.GetMode()
+	_, uok := in.GetUID()
+	_, gok := in.GetGID()
+	_, mok := in.GetMTime()
+	_, aok := in.GetATime()
+	_, truncate := in.GetSize()
+	ev := log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Str("real_path", physicalPath).Bool("indexed", indexed)
+	if chmod {
+		ev = ev.Bool("chmod", true)
+	}
+	if uok || gok {
+		ev = ev.Bool("chown", true)
+	}
+	if mok || aok {
+		ev = ev.Bool("utimens", true)
+	}
+	if truncate {
+		ev = ev.Bool("truncate", true)
+	}
+	ev.Msg("setattr")
+	return 0
+}
+
+// setattrCopies applies chmod, chown and utimens to every copy other than the one on primaryID.
+func (n *Node) setattrCopies(ctx context.Context, log zerolog.Logger, rt *router.Router, caller *gofuse.Caller, callerOK bool, primaryID string, virtualPath string, in *gofuse.SetAttrIn) syscall.Errno {
+	_, chmod := in.GetMode()
+	_, uok := in.GetUID()
+	_, gok := in.GetGID()
+	_, mok := in.GetMTime()
+	_, aok := in.GetATime()
+	if !chmod && !uok && !gok && !mok && !aok {
 		return 0
 	}
 
+	targets, err := rt.ResolveReadTargets(virtualPath)
+	if err != nil {
+		return toErrno(err)
+	}
+	for _, t := range targets {
+		if t.ID == primaryID {
+			continue
+		}
+		if !t.Indexed {
+			p := filepath.Join(t.Root, virtualPath)
+			st := syscall.Stat_t{}
+			if err := syscall.Lstat(p, &st); err != nil {
+				if errors.Is(err, syscall.ENOENT) {
+					continue
+				}
+				return toErrno(err)
+			}
+			if errno := setattrPhysical(caller, callerOK, nil, p, in); errno != 0 {
+				return errno
+			}
+			log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", t.ID).Str("real_path", p).Msg("setattr applied to copy")
+			continue
+		}
+
+		if n.db == nil {
+			log.Error().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", t.ID).Msg("failed to setattr: db is nil for indexed target")
+			return syscall.EIO
+		}
+		_, ok, err := n.db.GetEffectiveFile(ctx, t.ID, virtualPath)
+		if err != nil {
+			return toErrno(fmt.Errorf("failed to getattr indexed entry: %w", err))
+		}
+		if !ok {
+			continue
+		}
+		if errno := n.setattrIndexed(ctx, log, caller, callerOK, t.ID, virtualPath, in); errno != 0 {
+			return errno
+		}
+	}
+	return 0
+}
+
+// setattrIndexed records chmod, chown and utimens for an indexed entry as a deferred SETATTR.
+func (n *Node) setattrIndexed(ctx context.Context, log zerolog.Logger, caller *gofuse.Caller, callerOK bool, storageID string, virtualPath string, in *gofuse.SetAttrIn) syscall.Errno {
+	if n.db == nil {
+		log.Error().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Msg("failed to setattr: db is nil for indexed target")
+		return syscall.EIO
+	}
+	cur, ok, err := n.db.GetEffectiveFile(ctx, storageID, virtualPath)
+	if err != nil {
+		return toErrno(fmt.Errorf("failed to getattr indexed file: %w", err))
+	}
+	if !ok {
+		log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Msg("setattr indexed entry missing after resolution")
+		return syscall.ENOENT
+	}
+
+	uid, uok := in.GetUID()
+	gid, gok := in.GetGID()
+	if uok || gok {
+		if callerOK && caller.Uid != 0 {
+			return syscall.EPERM
+		}
+	}
+
+	var modePtr *uint32
+	if m, ok := in.GetMode(); ok {
+		if callerOK && caller.Uid != 0 {
+			if cur.UID != caller.Uid {
+				return syscall.EPERM
+			}
+		}
+		newMode := (cur.Mode & ^uint32(0o7777)) | (m & uint32(0o7777))
+		modePtr = &newMode
+	}
+
+	var uidPtr *uint32
+	var gidPtr *uint32
+	if uok {
+		u := uint32(uid)
+		uidPtr = &u
+	}
+	if gok {
+		g := uint32(gid)
+		gidPtr = &g
+	}
+
+	var mtimePtr *int64
+	if mtime, mok := in.GetMTime(); mok {
+		if callerOK && caller.Uid != 0 {
+			if cur.UID != caller.Uid {
+				return syscall.EPERM
+			}
+		}
+		mt := mtime.Unix()
+		mtimePtr = &mt
+	}
+
+	if modePtr == nil && uidPtr == nil && gidPtr == nil && mtimePtr == nil {
+		return 0
+	}
+	updated, err := n.db.UpsertMeta(ctx, storageID, virtualPath, modePtr, uidPtr, gidPtr, mtimePtr)
+	if err != nil {
+		return toErrno(err)
+	}
+	if !updated {
+		log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Msg("setattr indexed metadata update missed")
+		return 0
+	}
+	log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Msg("setattr updated indexed metadata")
+	if err := eventlog.Append(ctx, n.mountName, eventlog.SetattrEvent{Type: eventlog.TypeSetattr, StorageID: storageID, Path: virtualPath, Mode: modePtr, UID: uidPtr, GID: gidPtr, MTime: mtimePtr, TS: time.Now().Unix()}); err != nil {
+		log.Error().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Err(err).Msg("failed to append eventlog")
+		return syscall.EIO
+	}
+	log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", storageID).Msg("setattr appended deferred event")
+	return 0
+}
+
+// setattrPhysical applies chown, chmod and utimens to a non-indexed entry, preferring fh when set.
+func setattrPhysical(caller *gofuse.Caller, callerOK bool, fh *FileHandle, physicalPath string, in *gofuse.SetAttrIn) syscall.Errno {
 	old := syscall.Stat_t{}
 	oldOK := false
 	if err := syscall.Lstat(physicalPath, &old); err == nil {
@@ -322,38 +420,5 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 			return toErrno(err)
 		}
 	}
-
-	if sz, ok := in.GetSize(); ok {
-		// truncate: prefer ftruncate when we have a file handle.
-		if fh != nil {
-			if err := syscall.Ftruncate(fh.fd, int64(sz)); err != nil {
-				return toErrno(err)
-			}
-		} else {
-			if err := syscall.Truncate(physicalPath, int64(sz)); err != nil {
-				return toErrno(err)
-			}
-		}
-	}
-
-	st := syscall.Stat_t{}
-	if err := syscall.Lstat(physicalPath, &st); err != nil {
-		return toErrno(err)
-	}
-	out.FromStat(&st)
-	ev := log.Debug().Str("op", "setattr").Str("path", virtualPath).Str("storage_id", indexedStorageID).Str("real_path", physicalPath).Bool("indexed", false)
-	if _, ok := in.GetMode(); ok {
-		ev = ev.Bool("chmod", true)
-	}
-	if uok || gok {
-		ev = ev.Bool("chown", true)
-	}
-	if mok || aok {
-		ev = ev.Bool("utimens", true)
-	}
-	if _, ok := in.GetSize(); ok {
-		ev = ev.Bool("truncate", true)
-	}
-	ev.Msg("setattr")
 	return 0
 }

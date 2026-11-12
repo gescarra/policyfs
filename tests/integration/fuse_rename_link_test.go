@@ -167,3 +167,77 @@ func TestFUSE_Mv_crossTarget_shouldSucceedViaCopyFallback(t *testing.T) {
 		require.Equal(t, content, env.MustReadFileInStoragePath(t, "ssd1", dstRel))
 	})
 }
+
+// TestFUSE_Rename_renamesAllCopies verifies rename moves the entry on every read target that has it.
+func TestFUSE_Rename_renamesAllCopies(t *testing.T) {
+	withMountedFS(t, IntegrationConfig{
+		ReadTargets: []string{"ssd2", "ssd1"},
+		Targets:     []string{"ssd2", "ssd1"},
+	}, func(env *MountedFS) {
+		// Setup: create the same file on both targets.
+		oldRel := "fuse-mutate/rename-all/old.txt"
+		newRel := "fuse-mutate/rename-all/new.txt"
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd1", oldRel)
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd2", oldRel)
+
+		// Action: rename through the mount.
+		env.MustRenameFileInMountPoint(t, oldRel, newRel)
+
+		// Verify: renamed on both targets.
+		for _, id := range []string{"ssd1", "ssd2"} {
+			require.NoFileExists(t, env.StoragePath(id, oldRel))
+			require.FileExists(t, env.StoragePath(id, newRel))
+		}
+	})
+}
+
+// TestFUSE_Rename_overwrite_removesStaleDestinationCopies verifies an overwritten destination does not
+// survive on targets that held no source copy.
+func TestFUSE_Rename_overwrite_removesStaleDestinationCopies(t *testing.T) {
+	withMountedFS(t, IntegrationConfig{
+		ReadTargets: []string{"ssd2", "ssd1"},
+		Targets:     []string{"ssd2", "ssd1"},
+	}, func(env *MountedFS) {
+		// Setup: source on ssd2 only, destination on both targets.
+		oldRel := "fuse-mutate/rename-overwrite/old.txt"
+		newRel := "fuse-mutate/rename-overwrite/new.txt"
+		env.MustCreateFileInStoragePath(t, []byte("new"), "ssd2", oldRel)
+		env.MustCreateFileInStoragePath(t, []byte("stale"), "ssd1", newRel)
+		env.MustCreateFileInStoragePath(t, []byte("stale"), "ssd2", newRel)
+
+		// Action: rename over the existing destination.
+		env.MustRenameFileInMountPoint(t, oldRel, newRel)
+
+		// Verify: ssd2 holds the renamed file and the stale ssd1 copy is gone.
+		require.Equal(t, []byte("new"), env.MustReadFileInStoragePath(t, "ssd2", newRel))
+		require.NoFileExists(t, env.StoragePath("ssd1", newRel))
+	})
+}
+
+// TestFUSE_Rename_copyCrossTarget_returnsEXDEVWithoutChanges verifies no copy is renamed when any copy
+// would cross targets.
+func TestFUSE_Rename_copyCrossTarget_returnsEXDEVWithoutChanges(t *testing.T) {
+	withMountedFS(t, IntegrationConfig{
+		RoutingRules: []config.RoutingRule{
+			{Match: "fuse-mutate/rename-exdev/dst/**", WriteTargets: []string{"ssd1"}, ReadTargets: []string{"ssd1", "ssd2"}},
+			{Match: "**", WriteTargets: []string{"ssd1", "ssd2"}, ReadTargets: []string{"ssd1", "ssd2"}},
+		},
+	}, func(env *MountedFS) {
+		// Setup: source on both targets; destination is only writable on ssd1.
+		oldRel := "fuse-mutate/rename-exdev/src/old.txt"
+		newRel := "fuse-mutate/rename-exdev/dst/new.txt"
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd1", oldRel)
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd2", oldRel)
+		env.MustMkdirInMountPoint(t, "fuse-mutate/rename-exdev/dst")
+
+		// Action: attempt rename.
+		err := env.RenameFileInMountPoint(oldRel, newRel)
+		require.ErrorIs(t, err, syscall.EXDEV)
+
+		// Verify: neither copy moved.
+		for _, id := range []string{"ssd1", "ssd2"} {
+			require.FileExists(t, env.StoragePath(id, oldRel))
+			require.NoFileExists(t, env.StoragePath(id, newRel))
+		}
+	})
+}

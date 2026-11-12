@@ -31,6 +31,7 @@ type JobResult struct {
 	FilesSkipped       int64
 	FilesSkippedOpen   int64
 	FilesSkippedExists int64
+	FilesPartial       int64
 	FilesErrored       int64
 	DurationMS         int64
 	TotalCandidates    int64
@@ -157,8 +158,9 @@ func Plan(ctx context.Context, mountName string, mountCfg *config.MountConfig, o
 
 		// Best-effort destination resolution for display.
 		// This can be expensive (statfs/stat); only do it in debug mode.
+		mirror := strings.TrimSpace(j.Destination.Mode) == "mirror"
 		dstIDs := []string(nil)
-		if opts.Debug {
+		if opts.Debug || mirror {
 			dstIDs, _ = p.expandRefs(j.Destination.Paths, j.Destination.Groups)
 		}
 
@@ -168,6 +170,26 @@ func Plan(ctx context.Context, mountName string, mountCfg *config.MountConfig, o
 				break
 			}
 			wb := c.SizeBytes * mult
+			if mirror {
+				for _, id := range dstIDs {
+					if id == c.SrcStorageID {
+						continue
+					}
+					pj.Candidates = append(pj.Candidates, PlanCandidate{
+						JobName:      j.Name,
+						SrcStorageID: c.SrcStorageID,
+						DstStorageID: id,
+						RelPath:      c.RelPath,
+						SizeBytes:    c.SizeBytes,
+						MTimeSec:     c.MTimeSec,
+						WorkBytes:    wb,
+					})
+					pj.WorkBytes += wb
+					out.TotalCandidates++
+					out.TotalWorkBytes += wb
+				}
+				continue
+			}
 			dstID := ""
 			var ppKept []string
 			if len(dstIDs) > 0 {

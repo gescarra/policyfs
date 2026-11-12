@@ -125,6 +125,12 @@ Not all filesystem operations reach the physical disk immediately. The behavior 
 
 File creation and data writes always go to the physical disk - the deferred path only applies to metadata mutations (delete, rename, setattr). This means an indexed HDD only needs to spin up when new files are written to it, not when existing files are deleted or renamed.
 
+Delete, rename, and setattr apply to every copy of an entry across its read targets, so a file that exists on several storage paths (for example, mirrored copies) does not resurface from another disk. Truncate, writes, links, and symlinks only affect the copy being accessed.
+
+### Mirroring
+
+A mover job with `destination.mode: mirror` keeps a copy of each file on every destination storage path, for example two HDDs and an S3 mount. Copies are made asynchronously when the job runs, so a new file only has one copy until then. Reads use the first copy in `read_targets` order. Writing to a non-indexed copy makes the other copies stale until the next run, which rewrites them. See [Mirroring](config.md#mirroring).
+
 ## Disk spindown (power saving)
 
 PolicyFS can reduce disk wake-ups caused by metadata operations by using `indexed: true`, but it does not control drive power states.

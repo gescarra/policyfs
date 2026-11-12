@@ -165,3 +165,42 @@ mounts:
         write_policy: most_free
         path_preserving: true
 ```
+
+## 4) Redundant copies (mirroring)
+
+**Goal:** Land new files on a fast disk, then keep a copy on each of two HDDs and an S3 mount, like RAID1 across independent disks.
+
+**Suggested config:**
+
+```yaml
+mounts:
+  media:
+    storage_paths:
+      - { id: ssd, path: /mnt/ssd/media, indexed: false }
+      - { id: hdd1, path: /mnt/hdd1/media, indexed: true }
+      - { id: hdd2, path: /mnt/hdd2/media, indexed: true }
+      - { id: s3, path: /mnt/s3/media, indexed: true }
+    storage_groups:
+      hdds: [hdd1, hdd2]
+      remote: [s3]
+    routing_rules:
+      - match: '**'
+        read_targets: [ssd, hdds, remote]
+        write_targets: [ssd]
+    mover:
+      jobs:
+        - name: mirror
+          trigger:
+            type: manual
+          source:
+            paths: [ssd]
+            patterns: ['**']
+          destination:
+            groups: [hdds, remote]
+            mode: mirror
+          conditions:
+            min_age: 7d
+          delete_source: true
+```
+
+**Tips:** Set `delete_source: false` to also keep the SSD copy. Run `pfs move media --job mirror` again at any time; it only copies what is missing or stale.

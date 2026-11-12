@@ -386,3 +386,23 @@ func TestIndexed_readRenamedFile_shouldUseRealPath(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// TestIndexed_unlink_shouldRemoveEveryCopy verifies unlink removes a non-indexed copy immediately and
+// defers the indexed copy, so the file does not resurface from either target.
+func TestIndexed_unlink_shouldRemoveEveryCopy(t *testing.T) {
+	withMountedFS(t, createIndexedCfg(), func(env *MountedFS) {
+		rel := "indexed-ops/unlink-all/x.txt"
+		env.MustCreateFileInStoragePath(t, []byte("x"), "ssd1", rel)
+		env.MustCreateFileInStoragePath(t, []byte("x"), "hdd1", rel)
+		mustRunPFS(t, env, "index", env.MountName)
+
+		env.MustRemoveFileInMountPoint(t, rel)
+
+		require.NoFileExists(t, env.StoragePath("ssd1", rel))
+		require.FileExists(t, env.StoragePath("hdd1", rel))
+		require.False(t, env.FileExistsInMountPoint(rel))
+
+		mustRunPFS(t, env, "prune", env.MountName)
+		require.NoFileExists(t, env.StoragePath("hdd1", rel))
+	})
+}

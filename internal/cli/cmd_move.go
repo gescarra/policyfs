@@ -644,6 +644,9 @@ func printMoveSummary(w io.Writer, res mover.Result, warningsHuman []string) {
 		if jr.FilesSkippedExists > 0 {
 			fmt.Fprintf(w, "         skipped_exists %s\n", humanize.Comma(jr.FilesSkippedExists))
 		}
+		if jr.FilesPartial > 0 {
+			fmt.Fprintf(w, "         partial %s\n", humanize.Comma(jr.FilesPartial))
+		}
 	}
 	var totalErrors int64
 	for _, jr := range res.Jobs {

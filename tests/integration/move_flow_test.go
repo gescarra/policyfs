@@ -1131,3 +1131,60 @@ func TestMove_includeFileWithComments_shouldIgnoreCommentLines(t *testing.T) {
 		require.FileExists(t, env.StoragePath("hdd1", "library/a.txt"))
 	})
 }
+
+// TestMove_mirror_shouldCopyToEveryDestinationAndIndexIndexedCopies verifies mirror mode places a copy on
+// every destination, upserts indexed copies, and only then deletes the source.
+func TestMove_mirror_shouldCopyToEveryDestinationAndIndexIndexedCopies(t *testing.T) {
+	if os.Getenv(config.EnvIntegrationUseExistingMount) != "" {
+		t.Skip("skip move flow test when using an existing mount")
+	}
+
+	jobName := "mirror"
+	rel := "library/movies/m.txt"
+	content := []byte("hello-mirror")
+
+	mv := &config.MoverConfig{
+		Enabled: new(true),
+		Jobs: []config.MoverJobConfig{
+			{
+				Name:         jobName,
+				Trigger:      config.MoverTriggerConfig{Type: "manual"},
+				Source:       config.MoverSourceConfig{Paths: []string{"ssd1"}, Patterns: []string{"library/**"}},
+				Destination:  config.MoverDestinationConfig{Paths: []string{"hdd1", "ssd2"}, Mode: "mirror"},
+				DeleteSource: new(true),
+				Verify:       new(true),
+			},
+		},
+	}
+
+	cfg := IntegrationConfig{
+		Storages: []IntegrationStorage{
+			{ID: "ssd1", Indexed: false, BasePath: "/mnt/ssd1/pfs-integration"},
+			{ID: "ssd2", Indexed: false, BasePath: "/mnt/ssd2/pfs-integration"},
+			{ID: "hdd1", Indexed: true, BasePath: "/mnt/hdd1/pfs-integration"},
+		},
+		Targets:     []string{"ssd1"},
+		ReadTargets: []string{"ssd1", "ssd2", "hdd1"},
+		Mover:       mv,
+	}
+
+	withMountedFS(t, cfg, func(env *MountedFS) {
+		env.MustCreateFileInStoragePath(t, content, "ssd1", rel)
+
+		mustRunPFS(t, env, "move", env.MountName, "--job", jobName, "--progress=off")
+
+		require.NoFileExists(t, env.StoragePath("ssd1", rel))
+		require.Equal(t, content, env.MustReadFileInStoragePath(t, "hdd1", rel))
+		require.Equal(t, content, env.MustReadFileInStoragePath(t, "ssd2", rel))
+		require.Equal(t, content, env.MustReadFileInMountPoint(t, rel))
+
+		db := openIndexDB(t, env)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		var deleted int
+		err := db.QueryRowContext(ctx, `SELECT deleted FROM files WHERE storage_id = ? AND path = ? LIMIT 1;`, "hdd1", rel).Scan(&deleted)
+		require.NoError(t, err)
+		require.Equal(t, 0, deleted)
+	})
+}

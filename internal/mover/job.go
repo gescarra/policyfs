@@ -81,6 +81,11 @@ func (p *planner) runJob(ctx context.Context, j config.MoverJobConfig, hooks Hoo
 
 	thresholdStop := j.Trigger.ThresholdStop
 	stopJob := false
+	mirror := strings.TrimSpace(j.Destination.Mode) == "mirror"
+	var fileDeadline time.Time
+	if aw != nil && trigType == "usage" && !p.opts.Force && !finishCurrent {
+		fileDeadline = winEnd
+	}
 
 	for _, srcID := range activeSources {
 		if limit > 0 && movedSoFar+jr.FilesMoved >= limit {
@@ -123,6 +128,23 @@ func (p *planner) runJob(ctx context.Context, j config.MoverJobConfig, hooks Hoo
 					jr.FilesSkippedOpen++
 					continue
 				}
+			}
+
+			if mirror {
+				stop, err := p.mirrorCandidate(ctx, j, hooks, db, dstIDs, c, fileDeadline, &jr)
+				if err != nil {
+					return jr, err
+				}
+				if stop {
+					stopJob = true
+					continue
+				}
+				if trigType == "usage" && !p.opts.Force {
+					if pct, err := p.usagePct(p.storageByID[srcID].Path); err == nil && pct <= float64(thresholdStop) {
+						break
+					}
+				}
+				continue
 			}
 
 			if j.Destination.SkipIfExistsAny {
@@ -272,73 +294,12 @@ func (p *planner) runJob(ctx context.Context, j config.MoverJobConfig, hooks Hoo
 				}
 			}
 
-			// Delete source if configured.
-			deletedSourcePhysical := false
-			deletedSourceDeferred := false
-			srcSP := p.storageByID[c.SrcStorageID]
-			if jobDeleteSourceEnabled(j) {
-				if srcSP.Indexed {
-					if db == nil {
-						return jr, &errkind.NilError{What: "index db"}
-					}
-					updated, err := db.MarkDeleted(ctx, c.SrcStorageID, c.RelPath, false)
-					if err != nil {
-						jr.FilesErrored++
-						if hooks.Warn != nil {
-							hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
-						}
-						continue
-					}
-					if updated {
-						err := eventlog.Append(ctx, p.mountName, eventlog.DeleteEvent{Type: eventlog.TypeDelete, StorageID: c.SrcStorageID, Path: c.RelPath, IsDir: false, TS: p.now().Unix()})
-						if err != nil {
-							jr.FilesErrored++
-							if hooks.Warn != nil {
-								hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
-							}
-							continue
-						}
-						deletedSourceDeferred = true
-						// Space will be freed when prune runs.
-						jr.BytesFreed += c.SizeBytes
-					}
-				} else {
-					if err := syscall.Unlink(srcPhys); err != nil {
-						if !errors.Is(err, syscall.ENOENT) {
-							jr.FilesErrored++
-							if hooks.Warn != nil {
-								hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
-							}
-							continue
-						}
-					} else {
-						deletedSourcePhysical = true
-						jr.BytesFreed += c.SizeBytes
-					}
-				}
+			ok, err := p.deleteSource(ctx, j, hooks, db, c, srcPhys, &jr)
+			if err != nil {
+				return jr, err
 			}
-
-			if jobDeleteSourceEnabled(j) && jobDeleteEmptyDirEnabled(j) {
-				if srcSP.Indexed {
-					if deletedSourceDeferred {
-						if db == nil {
-							return jr, &errkind.NilError{What: "index db"}
-						}
-						if err := deleteEmptyDirsIndexed(ctx, db, p.mountName, c.SrcStorageID, c.RelPath, p.now); err != nil {
-							if hooks.Warn != nil {
-								hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
-							}
-						}
-					}
-				} else {
-					if deletedSourcePhysical {
-						if err := deleteEmptyDirsNonIndexed(srcSP.Path, filepath.Dir(srcPhys)); err != nil {
-							if hooks.Warn != nil {
-								hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
-							}
-						}
-					}
-				}
+			if !ok {
+				continue
 			}
 
 			jr.FilesMoved++
@@ -364,6 +325,63 @@ func (p *planner) runJob(ctx context.Context, j config.MoverJobConfig, hooks Hoo
 
 	jr.DurationMS = time.Since(jobStart).Milliseconds()
 	return jr, nil
+}
+
+// deleteSource removes the source after a successful copy when delete_source is enabled.
+// It returns false when the file errored and must not be counted as moved.
+func (p *planner) deleteSource(ctx context.Context, j config.MoverJobConfig, hooks Hooks, db *indexdb.DB, c candidate, srcPhys string, jr *JobResult) (bool, error) {
+	if !jobDeleteSourceEnabled(j) {
+		return true, nil
+	}
+	fail := func(err error) {
+		jr.FilesErrored++
+		if hooks.Warn != nil {
+			hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
+		}
+	}
+
+	srcSP := p.storageByID[c.SrcStorageID]
+	if srcSP.Indexed {
+		if db == nil {
+			return false, &errkind.NilError{What: "index db"}
+		}
+		updated, err := db.MarkDeleted(ctx, c.SrcStorageID, c.RelPath, false)
+		if err != nil {
+			fail(err)
+			return false, nil
+		}
+		if !updated {
+			return true, nil
+		}
+		err = eventlog.Append(ctx, p.mountName, eventlog.DeleteEvent{Type: eventlog.TypeDelete, StorageID: c.SrcStorageID, Path: c.RelPath, IsDir: false, TS: p.now().Unix()})
+		if err != nil {
+			fail(err)
+			return false, nil
+		}
+		// Space will be freed when prune runs.
+		jr.BytesFreed += c.SizeBytes
+		if jobDeleteEmptyDirEnabled(j) {
+			if err := deleteEmptyDirsIndexed(ctx, db, p.mountName, c.SrcStorageID, c.RelPath, p.now); err != nil && hooks.Warn != nil {
+				hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
+			}
+		}
+		return true, nil
+	}
+
+	if err := syscall.Unlink(srcPhys); err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return true, nil
+		}
+		fail(err)
+		return false, nil
+	}
+	jr.BytesFreed += c.SizeBytes
+	if jobDeleteEmptyDirEnabled(j) {
+		if err := deleteEmptyDirsNonIndexed(srcSP.Path, filepath.Dir(srcPhys)); err != nil && hooks.Warn != nil {
+			hooks.Warn(j.Name, c.SrcStorageID, c.RelPath, err)
+		}
+	}
+	return true, nil
 }
 
 // destPathExistsAny returns true if relPath already exists under any destination root.

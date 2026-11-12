@@ -299,6 +299,18 @@ func ValidateConfigAll(c *config.RootConfig) []error {
 				default:
 					errList = append(errList, &MountConfigError{Mount: mountName, Msg: fmt.Sprintf("mover.jobs[%d].destination.policy is invalid", ji)})
 				}
+				switch strings.TrimSpace(j.Destination.Mode) {
+				case "", "single":
+				case "mirror":
+					if j.Destination.SkipIfExistsAny {
+						errList = append(errList, &MountConfigError{Mount: mountName, Msg: fmt.Sprintf("mover.jobs[%d].destination.skip_if_exists_any is not supported with mode: mirror", ji)})
+					}
+					if j.Destination.PathPreserving {
+						errList = append(errList, &MountConfigError{Mount: mountName, Msg: fmt.Sprintf("mover.jobs[%d].destination.path_preserving is not supported with mode: mirror", ji)})
+					}
+				default:
+					errList = append(errList, &MountConfigError{Mount: mountName, Msg: fmt.Sprintf("mover.jobs[%d].destination.mode is invalid", ji)})
+				}
 
 				var minSizeBytes *int64
 				var maxSizeBytes *int64

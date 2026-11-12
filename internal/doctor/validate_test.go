@@ -295,6 +295,45 @@ func TestValidateConfigAll_shouldValidateMoverJobs(t *testing.T) {
 	require.Contains(t, msgs, "mover.jobs[3].conditions.min_size must be <= max_size")
 }
 
+// TestValidateConfigAll_shouldValidateMirrorMode verifies destination.mode values and mirror-only restrictions.
+func TestValidateConfigAll_shouldValidateMirrorMode(t *testing.T) {
+	cfg := &config.RootConfig{Mounts: map[string]config.MountConfig{
+		"m": {
+			MountPoint:   "/mnt/pfs/m",
+			StoragePaths: []config.StoragePath{{ID: "ssd1", Path: "/mnt/ssd1"}},
+			RoutingRules: []config.RoutingRule{{Match: "**"}},
+			Mover: config.MoverConfig{
+				Enabled: boolPtr(true),
+				Jobs: []config.MoverJobConfig{
+					{
+						Name:        "bad-mode",
+						Trigger:     config.MoverTriggerConfig{Type: "manual"},
+						Source:      config.MoverSourceConfig{Paths: []string{"ssd1"}, Patterns: []string{"**"}},
+						Destination: config.MoverDestinationConfig{Paths: []string{"ssd1"}, Mode: "raid"},
+					},
+					{
+						Name:    "bad-mirror",
+						Trigger: config.MoverTriggerConfig{Type: "manual"},
+						Source:  config.MoverSourceConfig{Paths: []string{"ssd1"}, Patterns: []string{"**"}},
+						Destination: config.MoverDestinationConfig{
+							Paths:           []string{"ssd1"},
+							Mode:            "mirror",
+							SkipIfExistsAny: true,
+							PathPreserving:  true,
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	msgs := mountMsgs(t, ValidateConfigAll(cfg), "m")
+
+	require.Contains(t, msgs, "mover.jobs[0].destination.mode is invalid")
+	require.Contains(t, msgs, "mover.jobs[1].destination.skip_if_exists_any is not supported with mode: mirror")
+	require.Contains(t, msgs, "mover.jobs[1].destination.path_preserving is not supported with mode: mirror")
+}
+
 // TestValidateConfigAll_shouldAllowIncludeFileWithoutPatterns verifies a job can omit source.patterns
 // when source.include_file is set.
 func TestValidateConfigAll_shouldAllowIncludeFileWithoutPatterns(t *testing.T) {

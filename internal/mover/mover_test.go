@@ -1080,3 +1080,140 @@ func TestDestPathExistsAny_shouldReturnErrorOnENOTDIR(t *testing.T) {
 	require.False(t, exists)
 	require.True(t, errors.Is(err, syscall.ENOTDIR), "expected ENOTDIR, got: %v", err)
 }
+
+// testMirrorPlanner builds a planner with one non-indexed source and two non-indexed destinations.
+func testMirrorPlanner(t *testing.T) (*planner, string, string, string) {
+	t.Helper()
+	srcDir := t.TempDir()
+	dst1Dir := t.TempDir()
+	dst2Dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(srcDir, "lib"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "lib", "a.txt"), []byte("src"), 0o644))
+
+	mc := &config.MountConfig{StoragePaths: []config.StoragePath{
+		{ID: "ssd1", Path: srcDir},
+		{ID: "hdd1", Path: dst1Dir},
+		{ID: "hdd2", Path: dst2Dir},
+	}}
+	p := newPlanner("media", mc, Opts{})
+	p.freeSpaceGB = func(_ string) (float64, error) { return 100, nil }
+	return p, srcDir, dst1Dir, dst2Dir
+}
+
+// testMirrorJob returns a manual mirror job from ssd1 to the given destinations.
+func testMirrorJob(deleteSource bool, dst ...string) config.MoverJobConfig {
+	return config.MoverJobConfig{
+		Name:         "mirror",
+		Trigger:      config.MoverTriggerConfig{Type: "manual"},
+		Source:       config.MoverSourceConfig{Paths: []string{"ssd1"}, Patterns: []string{"lib/**"}},
+		Destination:  config.MoverDestinationConfig{Paths: dst, Mode: "mirror"},
+		DeleteSource: new(deleteSource),
+		Verify:       new(false),
+	}
+}
+
+// TestRunJob_mirror_shouldCopyToAllDestinationsAndBeIdempotent verifies mirror mode copies to every
+// destination and a second run makes no changes.
+func TestRunJob_mirror_shouldCopyToAllDestinationsAndBeIdempotent(t *testing.T) {
+	p, srcDir, dst1Dir, dst2Dir := testMirrorPlanner(t)
+	j := testMirrorJob(false, "hdd1", "hdd2")
+	rel := filepath.Join("lib", "a.txt")
+
+	jr, err := p.runJob(context.Background(), j, Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesMoved)
+	require.Equal(t, int64(6), jr.BytesMoved)
+	require.FileExists(t, filepath.Join(srcDir, rel))
+	require.FileExists(t, filepath.Join(dst1Dir, rel))
+	require.FileExists(t, filepath.Join(dst2Dir, rel))
+
+	jr, err = p.runJob(context.Background(), j, Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), jr.FilesMoved)
+	require.Equal(t, int64(0), jr.BytesMoved)
+}
+
+// TestRunJob_mirror_staleCopy_shouldOverwrite verifies a destination copy with a different size is replaced.
+func TestRunJob_mirror_staleCopy_shouldOverwrite(t *testing.T) {
+	p, _, dst1Dir, _ := testMirrorPlanner(t)
+	rel := filepath.Join("lib", "a.txt")
+	require.NoError(t, os.MkdirAll(filepath.Join(dst1Dir, "lib"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dst1Dir, rel), []byte("stale copy"), 0o644))
+
+	jr, err := p.runJob(context.Background(), testMirrorJob(false, "hdd1"), Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesMoved)
+
+	b, err := os.ReadFile(filepath.Join(dst1Dir, rel))
+	require.NoError(t, err)
+	require.Equal(t, "src", string(b))
+}
+
+// TestRunJob_mirror_destinationBelowMinFree_shouldKeepSourceAndReportPartial verifies an unavailable
+// destination makes the file partial and prevents source deletion.
+func TestRunJob_mirror_destinationBelowMinFree_shouldKeepSourceAndReportPartial(t *testing.T) {
+	p, srcDir, dst1Dir, dst2Dir := testMirrorPlanner(t)
+	sp := p.storageByID["hdd2"]
+	sp.MinFreeGB = 10
+	p.storageByID["hdd2"] = sp
+	p.freeSpaceGB = func(path string) (float64, error) {
+		if path == dst2Dir {
+			return 1, nil
+		}
+		return 100, nil
+	}
+	rel := filepath.Join("lib", "a.txt")
+
+	jr, err := p.runJob(context.Background(), testMirrorJob(true, "hdd1", "hdd2"), Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesPartial)
+	require.Equal(t, int64(1), jr.FilesMoved)
+	require.FileExists(t, filepath.Join(srcDir, rel))
+	require.FileExists(t, filepath.Join(dst1Dir, rel))
+	require.NoFileExists(t, filepath.Join(dst2Dir, rel))
+}
+
+// TestRunJob_mirror_deleteSource_shouldDeleteOnceAllInSync verifies delete_source removes the source
+// after every destination holds a copy.
+func TestRunJob_mirror_deleteSource_shouldDeleteOnceAllInSync(t *testing.T) {
+	p, srcDir, dst1Dir, dst2Dir := testMirrorPlanner(t)
+	rel := filepath.Join("lib", "a.txt")
+
+	jr, err := p.runJob(context.Background(), testMirrorJob(true, "hdd1", "hdd2"), Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesMoved)
+	require.Equal(t, int64(3), jr.BytesFreed)
+	require.NoFileExists(t, filepath.Join(srcDir, rel))
+	require.FileExists(t, filepath.Join(dst1Dir, rel))
+	require.FileExists(t, filepath.Join(dst2Dir, rel))
+}
+
+// TestRunJob_mirror_sourceInDestinations_shouldNotDeleteSource verifies the source is never deleted
+// when it is itself one of the mirror destinations.
+func TestRunJob_mirror_sourceInDestinations_shouldNotDeleteSource(t *testing.T) {
+	p, srcDir, dst1Dir, _ := testMirrorPlanner(t)
+	rel := filepath.Join("lib", "a.txt")
+
+	jr, err := p.runJob(context.Background(), testMirrorJob(true, "ssd1", "hdd1"), Hooks{}, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesMoved)
+	require.FileExists(t, filepath.Join(srcDir, rel))
+	require.FileExists(t, filepath.Join(dst1Dir, rel))
+}
+
+// TestCopyFileWithVerify_overwrite_shouldReplaceDestination verifies overwrite replaces an existing destination.
+func TestCopyFileWithVerify_overwrite_shouldReplaceDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	require.NoError(t, os.WriteFile(src, []byte("new"), 0o644))
+	require.NoError(t, os.WriteFile(dst, []byte("old content"), 0o644))
+
+	c := testCandidate(t, src)
+	err := copyFileWithVerify(context.Background(), copyLocation{root: dir, physicalPath: src}, copyLocation{root: dir, physicalPath: dst, overwrite: true}, c, true, nil)
+	require.NoError(t, err)
+
+	b, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, "new", string(b))
+}
