@@ -1,8 +1,8 @@
 .PHONY: dev dev-build dev-down dev-shell dev-ports build build-local build-linux-amd64 package-deb test test-unit test-integration coverage fmt fmt-staged lint lint-staged hooks clean docs docs-serve
 
 # Mount the shared Git metadata at its host path so Git works inside linked worktrees.
-GIT_COMMON_DIR ?= $(shell cd "$$(git rev-parse --git-common-dir)" && pwd -P)
-export GIT_COMMON_DIR
+PFS_GIT_COMMON_DIR ?= $(shell cd "$$(git rev-parse --git-common-dir)" && pwd -P)
+export PFS_GIT_COMMON_DIR
 
 # Version info from git
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
