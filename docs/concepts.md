@@ -129,7 +129,7 @@ Delete, rename, and setattr apply to every copy of an entry across its read targ
 
 ### Mirroring
 
-A mover job with `destination.mode: mirror` keeps a copy of each file on every destination storage path, for example two HDDs and an S3 mount. Copies are made asynchronously when the job runs, so a new file only has one copy until then. Reads use the first copy in `read_targets` order. Writing to a non-indexed copy makes the other copies stale until the next run, which rewrites them. See [Mirroring](config.md#mirroring).
+A mover job with `destination.mode: mirror` keeps a copy of each file on every destination storage path, for example two HDDs and an S3 mount. Copies are made asynchronously when the job runs, so a new file only has one copy until then. Reads use the first copy in `read_targets` order. Writing to a non-indexed copy makes the other copies stale until the next run. If the edited copy is the source, the run rewrites the others from it. If it is a destination copy, the run leaves it alone and warns, because the source is now older; it never overwrites a newer copy. See [Mirroring](config.md#mirroring).
 
 ## Disk spindown (power saving)
 

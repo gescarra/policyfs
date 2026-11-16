@@ -34,13 +34,19 @@ func (p *planner) mirrorCandidate(ctx context.Context, j config.MoverJobConfig, 
 			srcIsDest = true
 			continue
 		}
-		inSync, err := p.mirrorInSync(ctx, db, dstID, c)
+		state, err := p.mirrorDestState(ctx, db, dstID, c)
 		if err != nil {
 			partial = true
 			warn(dstID, err)
 			continue
 		}
-		if inSync {
+		if state == mirrorInSync {
+			continue
+		}
+		if state == mirrorNewer {
+			// The copy was likely edited on the destination; keep it and the source until someone reconciles them.
+			partial = true
+			warn(dstID, errMirrorDestinationNewer)
 			continue
 		}
 		if len(p.filterAvailableDestinations([]string{dstID})) == 0 {
@@ -96,32 +102,64 @@ func (p *planner) mirrorCandidate(ctx context.Context, j config.MoverJobConfig, 
 	return false, nil
 }
 
-// mirrorInSync reports whether dstID already holds a copy of c with the same size and mtime.
+// mirrorState describes a destination copy relative to the source candidate.
+type mirrorState int
+
+const (
+	// mirrorMissing means the destination has no regular file at the path.
+	mirrorMissing mirrorState = iota
+	// mirrorStale means the destination copy differs and is not newer than the source.
+	mirrorStale
+	// mirrorInSync means the destination copy has the same size and mtime as the source.
+	mirrorInSync
+	// mirrorNewer means the destination copy has a newer mtime than the source.
+	mirrorNewer
+)
+
+// errMirrorDestinationNewer marks a destination copy left alone because it is newer than the source.
+var errMirrorDestinationNewer = errkind.SentinelError("destination copy is newer than source")
+
+// classifyMirrorCopy compares a destination copy's attributes with the source candidate.
+// A newer destination mtime wins over a size difference so edits made on a destination are never overwritten.
+func classifyMirrorCopy(regular bool, size int64, mtimeSec int64, c candidate) mirrorState {
+	switch {
+	case !regular:
+		return mirrorMissing
+	case mtimeSec > c.MTimeSec:
+		return mirrorNewer
+	case size == c.SizeBytes && mtimeSec == c.MTimeSec:
+		return mirrorInSync
+	default:
+		return mirrorStale
+	}
+}
+
+// mirrorDestState reports how dstID's copy of c compares to the source.
 // Indexed destinations are checked through the index so sleeping disks are not woken.
-func (p *planner) mirrorInSync(ctx context.Context, db *indexdb.DB, dstID string, c candidate) (bool, error) {
+func (p *planner) mirrorDestState(ctx context.Context, db *indexdb.DB, dstID string, c candidate) (mirrorState, error) {
 	sp := p.storageByID[dstID]
 	if sp.Indexed {
 		if db == nil {
-			return false, &errkind.NilError{What: "index db"}
+			return mirrorMissing, &errkind.NilError{What: "index db"}
 		}
 		f, ok, err := db.GetEffectiveFile(ctx, dstID, c.RelPath)
 		if err != nil {
-			return false, fmt.Errorf("failed to lookup indexed destination: %w", err)
+			return mirrorMissing, fmt.Errorf("failed to lookup indexed destination: %w", err)
 		}
 		if !ok {
-			return false, nil
+			return mirrorMissing, nil
 		}
-		return !f.IsDir && f.Size == c.SizeBytes && f.MTimeSec == c.MTimeSec, nil
+		return classifyMirrorCopy(!f.IsDir, f.Size, f.MTimeSec, c), nil
 	}
 
 	fi, err := os.Lstat(filepath.Join(sp.Path, c.RelPath))
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return mirrorMissing, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("failed to stat destination: %w", err)
+		return mirrorMissing, fmt.Errorf("failed to stat destination: %w", err)
 	}
-	return fi.Mode().IsRegular() && fi.Size() == c.SizeBytes && fi.ModTime().Unix() == c.MTimeSec, nil
+	return classifyMirrorCopy(fi.Mode().IsRegular(), fi.Size(), fi.ModTime().Unix(), c), nil
 }
 
 // mirrorCopy writes c to dstID, replacing any stale copy, and records it in the index when indexed.

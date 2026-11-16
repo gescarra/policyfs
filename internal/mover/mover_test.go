@@ -1149,6 +1149,57 @@ func TestRunJob_mirror_staleCopy_shouldOverwrite(t *testing.T) {
 	require.Equal(t, "src", string(b))
 }
 
+// TestRunJob_mirror_newerDestination_shouldKeepCopyAndSource verifies a destination copy newer than the
+// source is not overwritten, the file is reported partial, and delete_source keeps the source.
+func TestRunJob_mirror_newerDestination_shouldKeepCopyAndSource(t *testing.T) {
+	p, srcDir, dst1Dir, dst2Dir := testMirrorPlanner(t)
+	rel := filepath.Join("lib", "a.txt")
+	srcMTime := time.Unix(1_700_000_000, 0)
+	require.NoError(t, os.Chtimes(filepath.Join(srcDir, rel), srcMTime, srcMTime))
+	require.NoError(t, os.MkdirAll(filepath.Join(dst1Dir, "lib"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dst1Dir, rel), []byte("edited on hdd1"), 0o644))
+	dstMTime := srcMTime.Add(time.Hour)
+	require.NoError(t, os.Chtimes(filepath.Join(dst1Dir, rel), dstMTime, dstMTime))
+
+	var warns []error
+	hooks := Hooks{Warn: func(_ string, _ string, _ string, err error) { warns = append(warns, err) }}
+	jr, err := p.runJob(context.Background(), testMirrorJob(true, "hdd1", "hdd2"), hooks, nil, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), jr.FilesPartial)
+	require.Len(t, warns, 1)
+	require.ErrorIs(t, warns[0], errMirrorDestinationNewer)
+
+	b, err := os.ReadFile(filepath.Join(dst1Dir, rel))
+	require.NoError(t, err)
+	require.Equal(t, "edited on hdd1", string(b))
+	require.FileExists(t, filepath.Join(srcDir, rel))
+	require.FileExists(t, filepath.Join(dst2Dir, rel))
+}
+
+// TestClassifyMirrorCopy verifies how a destination copy is classified against the source.
+func TestClassifyMirrorCopy(t *testing.T) {
+	c := candidate{SizeBytes: 10, MTimeSec: 100}
+	tests := []struct {
+		name    string
+		regular bool
+		size    int64
+		mtime   int64
+		want    mirrorState
+	}{
+		{name: "not regular", regular: false, size: 10, mtime: 100, want: mirrorMissing},
+		{name: "same size and mtime", regular: true, size: 10, mtime: 100, want: mirrorInSync},
+		{name: "older mtime", regular: true, size: 10, mtime: 99, want: mirrorStale},
+		{name: "same mtime different size", regular: true, size: 11, mtime: 100, want: mirrorStale},
+		{name: "newer mtime same size", regular: true, size: 10, mtime: 101, want: mirrorNewer},
+		{name: "newer mtime different size", regular: true, size: 3, mtime: 101, want: mirrorNewer},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, classifyMirrorCopy(tt.regular, tt.size, tt.mtime, c))
+		})
+	}
+}
+
 // TestRunJob_mirror_destinationBelowMinFree_shouldKeepSourceAndReportPartial verifies an unavailable
 // destination makes the file partial and prevents source deletion.
 func TestRunJob_mirror_destinationBelowMinFree_shouldKeepSourceAndReportPartial(t *testing.T) {

@@ -1188,3 +1188,54 @@ func TestMove_mirror_shouldCopyToEveryDestinationAndIndexIndexedCopies(t *testin
 		require.Equal(t, 0, deleted)
 	})
 }
+
+// TestMove_mirror_newerIndexedDestination_shouldNotOverwrite verifies an indexed destination copy whose
+// indexed mtime is newer than the source is left alone and the source is kept despite delete_source.
+func TestMove_mirror_newerIndexedDestination_shouldNotOverwrite(t *testing.T) {
+	if os.Getenv(config.EnvIntegrationUseExistingMount) != "" {
+		t.Skip("skip move flow test when using an existing mount")
+	}
+
+	jobName := "mirror"
+	rel := "library/movies/m.txt"
+
+	mv := &config.MoverConfig{
+		Enabled: new(true),
+		Jobs: []config.MoverJobConfig{
+			{
+				Name:         jobName,
+				Trigger:      config.MoverTriggerConfig{Type: "manual"},
+				Source:       config.MoverSourceConfig{Paths: []string{"ssd1"}, Patterns: []string{"library/**"}},
+				Destination:  config.MoverDestinationConfig{Paths: []string{"hdd1"}, Mode: "mirror"},
+				DeleteSource: new(true),
+				Verify:       new(false),
+			},
+		},
+	}
+
+	cfg := IntegrationConfig{
+		Storages: []IntegrationStorage{
+			{ID: "ssd1", Indexed: false, BasePath: "/mnt/ssd1/pfs-integration"},
+			{ID: "hdd1", Indexed: true, BasePath: "/mnt/hdd1/pfs-integration"},
+		},
+		Targets:     []string{"ssd1"},
+		ReadTargets: []string{"ssd1", "hdd1"},
+		Mover:       mv,
+	}
+
+	withMountedFS(t, cfg, func(env *MountedFS) {
+		srcMTime := time.Unix(1_700_000_000, 0)
+		env.MustCreateFileInStoragePath(t, []byte("old source"), "ssd1", rel)
+		require.NoError(t, os.Chtimes(env.StoragePath("ssd1", rel), srcMTime, srcMTime))
+
+		env.MustCreateFileInStoragePath(t, []byte("newer hdd1"), "hdd1", rel)
+		dstMTime := srcMTime.Add(time.Hour)
+		require.NoError(t, os.Chtimes(env.StoragePath("hdd1", rel), dstMTime, dstMTime))
+		mustRunPFS(t, env, "index", env.MountName)
+
+		mustRunPFS(t, env, "move", env.MountName, "--job", jobName, "--progress=off")
+
+		require.Equal(t, []byte("newer hdd1"), env.MustReadFileInStoragePath(t, "hdd1", rel))
+		require.FileExists(t, env.StoragePath("ssd1", rel))
+	})
+}

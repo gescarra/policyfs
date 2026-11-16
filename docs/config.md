@@ -259,9 +259,45 @@ With `mode: mirror`, the mover copies each candidate to every destination storag
 
 - A destination that already has a copy with the same size and mtime is left alone. Indexed destinations are checked through the index, so in-sync disks are not woken.
 - A missing or stale copy is (re)written atomically. Runs are idempotent: re-running a job only fills in what is missing.
+- A destination copy with a newer mtime than the source is never overwritten, since it was most likely edited on that disk. The file is reported as `partial` with a warning, and the source is kept even with `delete_source`. To resolve it, copy the newer version back over the source (or delete the destination copy if the source is the one you want), and the next run brings every copy in line.
 - A destination that is offline or below `min_free_gb` is skipped with a warning, and the file is reported as `partial`. The next run retries it.
 - `delete_source` only removes the source once every destination holds an up-to-date copy. If the source is itself a destination, it is never deleted.
 - `policy` is ignored. `skip_if_exists_any` and `path_preserving` are not supported.
+
+**Example: mirror one folder.** Say you only care about redundancy for `photos/`. New photos land on `hdd1`, and you want a second copy on `hdd2`. Everything else stays single-copy:
+
+```yaml
+mounts:
+  media:
+    storage_paths:
+      - { id: hdd1, path: /mnt/hdd1/media, indexed: true }
+      - { id: hdd2, path: /mnt/hdd2/media, indexed: true }
+    routing_rules:
+      - match: 'photos/**'
+        read_targets: [hdd1, hdd2]
+        write_targets: [hdd1]
+      - match: '**'
+        targets: [hdd1, hdd2]
+        write_policy: most_free
+    mover:
+      jobs:
+        - name: mirror-photos
+          trigger:
+            type: manual
+          source:
+            paths: [hdd1]
+            patterns: ['photos/**']
+          destination:
+            paths: [hdd1, hdd2]
+            mode: mirror
+```
+
+- `source.patterns` is what scopes the job to the folder. It matches virtual paths relative to the mount root, so `photos/**` is `/mnt/media/photos/...` on the mount and `/mnt/hdd1/media/photos/...` on disk.
+- `hdd1` is both source and destination, so its copy is never deleted and you end up with the file on both disks. `delete_source` is irrelevant here.
+- The `photos/**` routing rule sends writes to `hdd1` only, so the job always knows where new files are. Reads try `hdd1` first and fall back to `hdd2`.
+- `type: manual` means "run whenever `pfs move` runs", so the packaged `pfs-move@media.timer` picks it up nightly. Run it by hand with `pfs move media --job mirror-photos`. Until it runs, new photos only exist on `hdd1`.
+
+For mirroring an entire mount from a cache disk to several destinations, see [Redundant copies](use-cases.md#4-redundant-copies-mirroring).
 
 #### `conditions`
 
